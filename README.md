@@ -1,8 +1,4 @@
-<!-- Level 1: Simple bio and stats -->
 
-### Hi, I'm Shubham!
-
-<!-- Level 2: Inspired by GPRM-style profile README -->
 
 # 👋 Hi, I'm Shubham!
 
