@@ -12,7 +12,7 @@
 
 💼 Check out my projects on [GitHub](https://github.com/Thesilentprogramer)<br/>
 
-📄 View my [Resume](https://drive.google.com/file/d/1nF8aiWD06Qs2MXYQY-wH7NO0xvZWcohK/view?usp=sharing)<br/>
+📄 View my [Resume](https://drive.google.com/file/d/13dvqxr-yIueOcWji-_4_8eccegL7t1Ej/view?usp=drive_link)<br/>
 
 📫 Reach me at **indulkarshubham13@gmail.com**<br/>
 
