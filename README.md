@@ -3,6 +3,6 @@
 </p>
 
 <p align="center">
-  <a href="https://drive.google.com/file/d/13dvqxr-yIueOcWji-_4_8eccegL7t1Ej/view?usp=drive_link">Resume</a>
+  <a href="https://drive.google.com/file/d/1BYfwrdLnv8EkyesEptlnqowcYD93UyC2/view?usp=sharing">Resume</a>
   · indulkarshubham13@gmail.com
 </p>
