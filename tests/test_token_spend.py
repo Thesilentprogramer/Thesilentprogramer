@@ -345,6 +345,122 @@ class ExtraSourceTests(unittest.TestCase):
         ledger = json.loads(self.ledger.read_text())
         self.assertEqual(ledger["cursor"]["composer-a"], {"all": 19, "fresh": 19, "day": "2026-01-02"})
 
+    def test_cursor_bubble_cache_reads_count_in_all_not_fresh(self):
+        write_cursor_db(self.home, [
+            ("bubbleId:composer-a:b1", json.dumps({
+                "createdAt": "2026-10-01T01:00:00.000Z",
+                "tokenCount": {
+                    "inputTokens": 10, "outputTokens": 5,
+                    "cacheReadTokens": 40, "cacheWriteTokens": 2,
+                },
+            })),
+        ])
+        got = MODULE.scan_cursor(str(self.home))
+        self.assertEqual(got["composer-a"], {"all": 57, "fresh": 17, "day": "2026-10-01"})
+
+    def test_cursor_dashboard_fills_zero_bubbles_and_keeps_larger_legacy(self):
+        write_cursor_db(self.home, [
+            ("bubbleId:legacy:b1", json.dumps({
+                "createdAt": "2026-01-02T01:00:00.000Z",
+                "tokenCount": {"inputTokens": 100, "outputTokens": 50},
+            })),
+            ("bubbleId:new-chat:b1", json.dumps({
+                "createdAt": "2026-10-13T01:00:00.000Z",
+                "tokenCount": {"inputTokens": 0, "outputTokens": 0},
+            })),
+        ])
+        path = self.home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE ItemTable (key TEXT UNIQUE, value BLOB)")
+        con.execute("INSERT INTO ItemTable VALUES (?, ?)", ("cursorAuth/accessToken", "fake-token"))
+        con.commit()
+        con.close()
+
+        events = {
+            "usageEventsDisplay": [
+                {
+                    "timestamp": "1760400000000",
+                    "model": "grok-4.6",
+                    "kind": "USAGE",
+                    "conversationId": "new-chat",
+                    "tokenUsage": {
+                        "inputTokens": 20, "outputTokens": 8,
+                        "cacheReadTokens": 100, "cacheWriteTokens": 4,
+                    },
+                },
+                {
+                    "timestamp": "1760400001000",
+                    "model": "grok-4.6",
+                    "kind": "USAGE_NOT_CHARGED",
+                    "conversationId": "new-chat",
+                    "tokenUsage": {"inputTokens": 999, "outputTokens": 999},
+                },
+                {
+                    "timestamp": "1760400002000",
+                    "model": "grok-4.6",
+                    "kind": "USAGE",
+                    "conversationId": "legacy",
+                    "tokenUsage": {"inputTokens": 1, "outputTokens": 1},
+                },
+            ]
+        }
+
+        with mock.patch.object(MODULE, "_http_json_post", return_value=events):
+            got = MODULE.scan_cursor(str(self.home))
+
+        self.assertEqual(got["new-chat"]["all"], 32)
+        self.assertEqual(got["new-chat"]["fresh"], 32)
+        self.assertEqual(got["legacy"], {"all": 150, "fresh": 150, "day": "2026-01-02"})
+
+    def test_cursor_dashboard_failure_keeps_bubble_totals(self):
+        write_cursor_db(self.home, [
+            ("bubbleId:composer-a:b1", json.dumps({
+                "createdAt": "2026-01-02T01:00:00.000Z",
+                "tokenCount": {"inputTokens": 10, "outputTokens": 9},
+            })),
+        ])
+        path = self.home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE ItemTable (key TEXT UNIQUE, value BLOB)")
+        con.execute("INSERT INTO ItemTable VALUES (?, ?)", ("cursorAuth/accessToken", "fake-token"))
+        con.commit()
+        con.close()
+
+        with mock.patch.object(MODULE, "_http_json_post", side_effect=OSError("offline")):
+            got = MODULE.scan_cursor(str(self.home))
+        self.assertEqual(got["composer-a"], {"all": 19, "fresh": 19, "day": "2026-01-02"})
+
+    def test_cursor_dashboard_duplicate_pages_count_once(self):
+        write_cursor_db(self.home, [])
+        path = self.home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE ItemTable (key TEXT UNIQUE, value BLOB)")
+        con.execute("INSERT INTO ItemTable VALUES (?, ?)", ("cursorAuth/accessToken", "fake-token"))
+        con.commit()
+        con.close()
+        events = {
+            "usageEventsDisplay": [
+                {
+                    "timestamp": "1760400000000",
+                    "kind": "USAGE",
+                    "conversationId": "dup",
+                    "tokenUsage": {"inputTokens": 10, "outputTokens": 5},
+                },
+                {
+                    "timestamp": "1760400000001",
+                    "kind": "USAGE",
+                    "conversationId": "dup",
+                    "tokenUsage": {"inputTokens": 1, "outputTokens": 1},
+                },
+            ]
+        }
+        with mock.patch.object(MODULE, "CURSOR_USAGE_PAGE", 2), mock.patch.object(
+            MODULE, "MAX_CURSOR_USAGE_PAGES", 5
+        ), mock.patch.object(MODULE, "_http_json_post", return_value=events):
+            got = MODULE.scan_cursor(str(self.home))
+        self.assertEqual(got["dup"]["all"], 17)
+        self.assertEqual(got["dup"]["fresh"], 17)
+
     def test_antigravity_sums_reported_fields_and_ignores_the_rest(self):
         write_antigravity_db(self.home, "sess.db", [usage_blob(100, 40), usage_blob(7, 3), b"\xff\xff"])
         empty = self.home / ".gemini" / "antigravity" / "conversations" / "notes.db"

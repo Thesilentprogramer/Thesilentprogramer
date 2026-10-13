@@ -19,6 +19,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 REPO = "Thesilentprogramer/Thesilentprogramer"
@@ -30,6 +33,10 @@ GH_FALLBACKS = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]
 SYSTEM_PYTHON = "/usr/bin/python3"
 LEDGER_VERSION = 1
 CODEX_FIELDS = ("total_tokens", "cached_input_tokens")
+CURSOR_USAGE_START_MS = "1761350400000"  # 2025-10-25, matches the first ledger day
+CURSOR_USAGE_PAGE = 200
+# ponytail: dashboard API stops at 50 pages (~10k events). Raise if lifetime history truncates.
+MAX_CURSOR_USAGE_PAGES = 50
 
 
 def support_dir(home):
@@ -124,8 +131,14 @@ def scan_codex(home):
     return files
 
 
+def _token_pair(inp, out, cache_read=0, cache_write=0):
+    """(all, fresh). fresh skips cache reads, same split Codex uses."""
+    fresh = inp + out + cache_write
+    return fresh + cache_read, fresh
+
+
 def _bubble_usage(raw):
-    """(total, day) from a Cursor bubble, or None. Skips rows that are not token records."""
+    """(all, fresh, day) from a Cursor bubble, or None. Skips rows that are not token records."""
     if isinstance(raw, bytes):
         text = raw.decode("utf-8", "replace")
     else:
@@ -139,8 +152,143 @@ def _bubble_usage(raw):
         match = re.search(rf'"{name}"\s*:\s*(-?\d+)', body)
         return int(match.group(1)) if match else 0
 
+    total, fresh = _token_pair(
+        num("inputTokens"), num("outputTokens"), num("cacheReadTokens"), num("cacheWriteTokens")
+    )
+    if total <= 0:
+        return None
     created = re.search(r'"createdAt"\s*:\s*"(\d{4}-\d{2}-\d{2})', text)
-    return num("inputTokens") + num("outputTokens"), created.group(1) if created else None
+    return total, fresh, created.group(1) if created else None
+
+
+def _cursor_user_id(token):
+    decoded = urllib.parse.unquote(token)
+    if "::" in decoded:
+        return decoded.split("::", 1)[0]
+    parts = decoded.split(".")
+    if len(parts) != 3:
+        return None
+    pad = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(pad.encode()))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    match = re.search(r"user_[A-Za-z0-9]+", payload.get("sub") or "")
+    return match.group(0) if match else None
+
+
+def _ms_day(ts):
+    try:
+        return datetime.utcfromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _http_json_post(url, headers, payload):
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _scan_cursor_dashboard(token):
+    """Per conversation {all, fresh, day} from Cursor's usage dashboard.
+
+    Current Cursor builds leave bubble tokenCount at 0. The billed events still
+    exist on the account dashboard. Failures return {} so the bubble scan stands.
+    """
+    if not token:
+        return {}
+    user_id = _cursor_user_id(token)
+    cookie = token
+    if "::" in cookie and "%3A%3A" not in cookie:
+        cookie = cookie.replace("::", "%3A%3A")
+    elif user_id and "::" not in token and "%3A%3A" not in token:
+        cookie = user_id + "%3A%3A" + token
+    end_ms = str(int(datetime.now(timezone.utc).timestamp() * 1000))
+    dashboard_payload = {
+        "startDate": CURSOR_USAGE_START_MS,
+        "endDate": end_ms,
+        "pageSize": CURSOR_USAGE_PAGE,
+    }
+    api2_payload = dict(dashboard_payload)
+    if user_id:
+        api2_payload["userId"] = user_id
+    attempts = (
+        (
+            "https://cursor.com/api/dashboard/get-filtered-usage-events",
+            {
+                "Cookie": "WorkosCursorSessionToken=" + cookie,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Origin": "https://cursor.com",
+                "Referer": "https://cursor.com/dashboard",
+            },
+            dashboard_payload,
+        ),
+        (
+            "https://api2.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents",
+            {
+                "Authorization": "Bearer " + token.split("::")[-1].split("%3A%3A")[-1],
+                "Content-Type": "application/json",
+                "connect-protocol-version": "1",
+            },
+            api2_payload,
+        ),
+    )
+    last_error = None
+    for url, headers, payload in attempts:
+        sessions = {}
+        seen = set()
+        try:
+            for page in range(1, MAX_CURSOR_USAGE_PAGES + 1):
+                body = dict(payload)
+                body["page"] = page
+                data = _http_json_post(url, headers, body)
+                rows = data.get("usageEventsDisplay") or data.get("usage_events") or []
+                if not rows:
+                    break
+                new_on_page = 0
+                for index, event in enumerate(rows):
+                    kind = event.get("kind") or ""
+                    if kind.endswith("_NOT_CHARGED"):
+                        continue
+                    usage = event.get("tokenUsage") or event.get("token_usage") or {}
+                    inp = int(usage.get("inputTokens") or usage.get("input_tokens") or 0)
+                    out = int(usage.get("outputTokens") or usage.get("output_tokens") or 0)
+                    cache_read = int(usage.get("cacheReadTokens") or usage.get("cache_read_tokens") or 0)
+                    cache_write = int(usage.get("cacheWriteTokens") or usage.get("cache_write_tokens") or 0)
+                    # Card total historically ignored cache reads (old bubbles had none).
+                    total, fresh = _token_pair(inp, out, 0, cache_write)
+                    if total <= 0:
+                        continue
+                    stamp = event.get("timestamp")
+                    cid = event.get("conversationId") or event.get("conversation_id") or "api:%s:%s:%s" % (
+                        stamp, event.get("model") or "auto", index
+                    )
+                    event_key = (stamp, cid, kind, inp, out, cache_read, cache_write)
+                    if event_key in seen:
+                        continue
+                    seen.add(event_key)
+                    new_on_page += 1
+                    day = _ms_day(stamp)
+                    slot = sessions.setdefault(cid, {"all": 0, "fresh": 0, "day": day})
+                    slot["all"] += total
+                    slot["fresh"] += fresh
+                    if day and (not slot["day"] or day < slot["day"]):
+                        slot["day"] = day
+                if new_on_page == 0 or len(rows) < CURSOR_USAGE_PAGE:
+                    break
+            if sessions:
+                return sessions
+            last_error = "empty"
+        except urllib.error.HTTPError as exc:
+            last_error = "HTTP %s" % exc.code
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError, json.JSONDecodeError) as exc:
+            last_error = str(exc.reason) if isinstance(exc, urllib.error.URLError) else str(exc)
+    if last_error:
+        print("cursor dashboard skipped: %s" % last_error)
+    return {}
 
 
 def _open_sqlite_ro(path):
@@ -157,11 +305,25 @@ def _open_sqlite_ro(path):
         return con, tmp
 
 
-def scan_cursor(home):
-    """Per conversation {all, fresh, day} from Cursor's state.vscdb.
+def _merge_session(sessions, cid, total, fresh, day):
+    slot = sessions.get(cid)
+    if slot is None:
+        sessions[cid] = {"all": total, "fresh": fresh, "day": day}
+        return
+    if total > slot["all"]:
+        slot["all"] = total
+        slot["fresh"] = max(slot["fresh"], fresh)
+        if day and (not slot["day"] or day < slot["day"]):
+            slot["day"] = day
+    else:
+        slot["fresh"] = max(slot["fresh"], fresh)
 
-    fresh equals all: bubbles report inputTokens and outputTokens, not cache reads.
-    A locked or unreadable database yields {} so the upload job still runs.
+
+def scan_cursor(home):
+    """Per conversation {all, fresh, day} from bubbles, then the usage dashboard.
+
+    Newer Cursor builds leave bubble tokenCount at 0. Dashboard events fill that gap.
+    A locked database yields {} so the upload job still runs.
     """
     path = os.path.join(home, "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb")
     if not os.path.isfile(path):
@@ -172,30 +334,43 @@ def scan_cursor(home):
     except (OSError, sqlite3.Error):
         return {}
     sessions = {}
+    token = None
     try:
+        try:
+            row = con.execute(
+                "SELECT value FROM ItemTable WHERE key = ?", ("cursorAuth/accessToken",)
+            ).fetchone()
+            if row and row[0]:
+                token = row[0].decode("utf-8", "replace") if isinstance(row[0], bytes) else row[0]
+        except sqlite3.Error:
+            token = None
         try:
             rows = con.execute("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
         except sqlite3.Error:
-            return {}
+            rows = []
         for key, raw in rows:
             parts = key.split(":")
             if len(parts) < 3:
                 continue
             usage = _bubble_usage(raw)
-            if not usage or usage[0] <= 0:
+            if not usage:
                 continue
-            total, day = usage
+            total, fresh, day = usage
             slot = sessions.setdefault(parts[1], {"all": 0, "fresh": 0, "day": day})
             slot["all"] += total
-            slot["fresh"] = slot["all"]
+            slot["fresh"] += fresh
             if day and (not slot["day"] or day < slot["day"]):
                 slot["day"] = day
     except (sqlite3.Error, OSError, ValueError):
-        return {}
+        sessions = {}
+        token = None
     finally:
         con.close()
         if tmp:
             os.remove(tmp)
+    if token:
+        for cid, counts in _scan_cursor_dashboard(token).items():
+            _merge_session(sessions, cid, counts["all"], counts["fresh"], counts.get("day"))
     return sessions
 
 
