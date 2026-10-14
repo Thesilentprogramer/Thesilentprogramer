@@ -204,6 +204,22 @@ def _iso_to_ms(stamp):
         return None
 
 
+def _resolve_cursor_token(token):
+    """User API keys (crsr_...) exchange for a short-lived dashboard access token."""
+    if not token or not token.startswith("crsr_"):
+        return token
+    data = _http_json_post(
+        "https://api2.cursor.sh/auth/exchange_user_api_key",
+        {
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        {},
+    )
+    return data.get("accessToken") or token
+
+
 def _scan_cursor_dashboard(token, start_ms=None):
     """Per conversation {all, fresh, day} from Cursor's usage dashboard.
 
@@ -212,6 +228,7 @@ def _scan_cursor_dashboard(token, start_ms=None):
     """
     if not token:
         return {}
+    token = _resolve_cursor_token(token)
     user_id = _cursor_user_id(token)
     cookie = token
     if "::" in cookie and "%3A%3A" not in cookie:

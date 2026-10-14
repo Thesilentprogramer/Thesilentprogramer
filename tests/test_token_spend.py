@@ -497,6 +497,29 @@ class ExtraSourceTests(unittest.TestCase):
         start = post.call_args[0][2]["startDate"]
         self.assertGreater(int(start), MODULE._iso_to_ms("2026-10-13T19:45:34Z"))
 
+    def test_crsr_key_exchanges_before_dashboard(self):
+        events = {
+            "usageEventsDisplay": [{
+                "timestamp": "1760400000000",
+                "kind": "USAGE",
+                "conversationId": "ex",
+                "tokenUsage": {"inputTokens": 2, "outputTokens": 3},
+            }]
+        }
+        calls = []
+
+        def fake_post(url, headers, payload):
+            calls.append(url)
+            if "exchange_user_api_key" in url:
+                return {"accessToken": "jwt-from-exchange"}
+            return events
+
+        with mock.patch.object(MODULE, "_http_json_post", side_effect=fake_post):
+            got = MODULE._scan_cursor_dashboard("crsr_testkey")
+        self.assertEqual(got["ex"]["all"], 5)
+        self.assertIn("exchange_user_api_key", calls[0])
+        self.assertGreaterEqual(len(calls), 2)
+
     def test_actions_write_skips_when_cursor_token_missing(self):
         path = Path(self.tmp.name) / "tokens.json"
         path.write_text(json.dumps({
