@@ -191,7 +191,20 @@ def _http_json_post(url, headers, payload):
         return json.loads(resp.read().decode())
 
 
-def _scan_cursor_dashboard(token):
+def _cursor_env_token():
+    return os.environ.get("CURSOR_TOKEN") or os.environ.get("CURSOR_SESSION_TOKEN") or ""
+
+
+def _iso_to_ms(stamp):
+    if not stamp:
+        return None
+    try:
+        return int(datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _scan_cursor_dashboard(token, start_ms=None):
     """Per conversation {all, fresh, day} from Cursor's usage dashboard.
 
     Current Cursor builds leave bubble tokenCount at 0. The billed events still
@@ -207,7 +220,7 @@ def _scan_cursor_dashboard(token):
         cookie = user_id + "%3A%3A" + token
     end_ms = str(int(datetime.now(timezone.utc).timestamp() * 1000))
     dashboard_payload = {
-        "startDate": CURSOR_USAGE_START_MS,
+        "startDate": start_ms or CURSOR_USAGE_START_MS,
         "endDate": end_ms,
         "pageSize": CURSOR_USAGE_PAGE,
     }
@@ -323,55 +336,79 @@ def scan_cursor(home):
     """Per conversation {all, fresh, day} from bubbles, then the usage dashboard.
 
     Newer Cursor builds leave bubble tokenCount at 0. Dashboard events fill that gap.
+    GitHub Actions has no local DB; CURSOR_TOKEN then drives the dashboard alone.
     A locked database yields {} so the upload job still runs.
     """
     path = os.path.join(home, "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb")
-    if not os.path.isfile(path):
-        return {}
-    tmp = None
-    try:
-        con, tmp = _open_sqlite_ro(path)
-    except (OSError, sqlite3.Error):
-        return {}
     sessions = {}
-    token = None
-    try:
+    token = _cursor_env_token()
+    if os.path.isfile(path):
+        tmp = None
         try:
-            row = con.execute(
-                "SELECT value FROM ItemTable WHERE key = ?", ("cursorAuth/accessToken",)
-            ).fetchone()
-            if row and row[0]:
-                token = row[0].decode("utf-8", "replace") if isinstance(row[0], bytes) else row[0]
-        except sqlite3.Error:
-            token = None
-        try:
-            rows = con.execute("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
-        except sqlite3.Error:
-            rows = []
-        for key, raw in rows:
-            parts = key.split(":")
-            if len(parts) < 3:
-                continue
-            usage = _bubble_usage(raw)
-            if not usage:
-                continue
-            total, fresh, day = usage
-            slot = sessions.setdefault(parts[1], {"all": 0, "fresh": 0, "day": day})
-            slot["all"] += total
-            slot["fresh"] += fresh
-            if day and (not slot["day"] or day < slot["day"]):
-                slot["day"] = day
-    except (sqlite3.Error, OSError, ValueError):
-        sessions = {}
-        token = None
-    finally:
-        con.close()
-        if tmp:
-            os.remove(tmp)
+            con, tmp = _open_sqlite_ro(path)
+        except (OSError, sqlite3.Error):
+            con = None
+            tmp = None
+        if con is not None:
+            try:
+                try:
+                    row = con.execute(
+                        "SELECT value FROM ItemTable WHERE key = ?", ("cursorAuth/accessToken",)
+                    ).fetchone()
+                    if row and row[0]:
+                        token = row[0].decode("utf-8", "replace") if isinstance(row[0], bytes) else row[0]
+                except sqlite3.Error:
+                    pass
+                try:
+                    rows = con.execute("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
+                except sqlite3.Error:
+                    rows = []
+                for key, raw in rows:
+                    parts = key.split(":")
+                    if len(parts) < 3:
+                        continue
+                    usage = _bubble_usage(raw)
+                    if not usage:
+                        continue
+                    total, fresh, day = usage
+                    slot = sessions.setdefault(parts[1], {"all": 0, "fresh": 0, "day": day})
+                    slot["all"] += total
+                    slot["fresh"] += fresh
+                    if day and (not slot["day"] or day < slot["day"]):
+                        slot["day"] = day
+            except (sqlite3.Error, OSError, ValueError):
+                sessions = {}
+            finally:
+                con.close()
+                if tmp:
+                    os.remove(tmp)
     if token:
         for cid, counts in _scan_cursor_dashboard(token).items():
             _merge_session(sessions, cid, counts["all"], counts["fresh"], counts.get("day"))
     return sessions
+
+
+def bump_tokens_from_dashboard(path, token, now=None):
+    """Add Cursor events newer than path's `updated` stamp. Never lowers the file.
+
+    Used on GitHub Actions, which has no Antigravity/Codex logs. A full rescan
+    there would drop those totals. Incremental dashboard events keep the floor.
+    """
+    with open(path, encoding="utf-8") as fh:
+        existing = json.load(fh)
+    start = _iso_to_ms(existing.get("updated"))
+    extra = _scan_cursor_dashboard(token, str(start + 1) if start is not None else None)
+    add_all = sum(item["all"] for item in extra.values())
+    add_fresh = sum(item["fresh"] for item in extra.values())
+    if add_all <= 0:
+        return existing, False
+    now = now or datetime.now(timezone.utc)
+    return {
+        "total": int(existing["total"]) + add_all,
+        "fresh": int(existing["fresh"]) + add_fresh,
+        "since": existing.get("since"),
+        "updated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }, True
 
 
 def _proto_fields(data, depth=0):
@@ -766,6 +803,16 @@ def main(argv=None):
         return install(home)
     if args.uninstall:
         return uninstall(home)
+    if args.write and os.environ.get("GITHUB_ACTIONS") and os.path.isfile(args.write):
+        token = _cursor_env_token()
+        if not token:
+            print("CURSOR_TOKEN unset; leaving %s unchanged" % args.write)
+            return
+        output, changed = bump_tokens_from_dashboard(args.write, token)
+        print("tokens file %s -> %s" % (changed, output.get("total")))
+        if changed:
+            write_output(output, args.write)
+        return
     ledger_path = args.ledger or os.path.join(support_dir(home), "ledger.json")
     gh = published = None
     if args.upload:

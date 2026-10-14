@@ -461,6 +461,54 @@ class ExtraSourceTests(unittest.TestCase):
         self.assertEqual(got["dup"]["all"], 17)
         self.assertEqual(got["dup"]["fresh"], 17)
 
+    def test_cursor_env_token_works_without_a_local_db(self):
+        events = {
+            "usageEventsDisplay": [{
+                "timestamp": "1760400000000",
+                "kind": "USAGE",
+                "conversationId": "ci",
+                "tokenUsage": {"inputTokens": 4, "outputTokens": 6, "cacheWriteTokens": 1},
+            }]
+        }
+        with mock.patch.dict(os.environ, {"CURSOR_TOKEN": "fake-token"}), mock.patch.object(
+            MODULE, "_http_json_post", return_value=events
+        ):
+            got = MODULE.scan_cursor(str(self.home))
+        self.assertEqual(got["ci"], {"all": 11, "fresh": 11, "day": "2025-10-14"})
+
+    def test_actions_bump_adds_only_events_after_updated(self):
+        path = Path(self.tmp.name) / "tokens.json"
+        path.write_text(json.dumps({
+            "total": 100, "fresh": 80, "since": "2025-10-25", "updated": "2026-10-13T19:45:34Z",
+        }))
+        events = {
+            "usageEventsDisplay": [{
+                "timestamp": "1760384735000",
+                "kind": "USAGE",
+                "conversationId": "late",
+                "tokenUsage": {"inputTokens": 3, "outputTokens": 2},
+            }]
+        }
+        with mock.patch.object(MODULE, "_http_json_post", return_value=events) as post:
+            out, changed = MODULE.bump_tokens_from_dashboard(str(path), "fake-token")
+        self.assertTrue(changed)
+        self.assertEqual(out["total"], 105)
+        self.assertEqual(out["fresh"], 85)
+        start = post.call_args[0][2]["startDate"]
+        self.assertGreater(int(start), MODULE._iso_to_ms("2026-10-13T19:45:34Z"))
+
+    def test_actions_write_skips_when_cursor_token_missing(self):
+        path = Path(self.tmp.name) / "tokens.json"
+        path.write_text(json.dumps({
+            "total": 100, "fresh": 80, "since": "2025-10-25", "updated": "2026-10-13T19:45:34Z",
+        }))
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=False):
+            os.environ.pop("CURSOR_TOKEN", None)
+            os.environ.pop("CURSOR_SESSION_TOKEN", None)
+            out = self.run_main("--write", str(path))
+        self.assertIn("CURSOR_TOKEN unset", out)
+        self.assertEqual(json.loads(path.read_text())["total"], 100)
+
     def test_antigravity_sums_reported_fields_and_ignores_the_rest(self):
         write_antigravity_db(self.home, "sess.db", [usage_blob(100, 40), usage_blob(7, 3), b"\xff\xff"])
         empty = self.home / ".gemini" / "antigravity" / "conversations" / "notes.db"

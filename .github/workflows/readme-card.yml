@@ -26,6 +26,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Update token spend
+        env:
+          CURSOR_TOKEN: ${{ secrets.CURSOR_TOKEN }}
+        run: python scripts/token_spend.py --write data/tokens.json
+
       - name: Generate README card
         env:
           # Every stat on the card is public data, so the built-in token is enough and never expires
@@ -36,7 +41,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add assets/readme.svg
+          git add data/tokens.json assets/readme.svg
           git diff --staged --quiet && exit 0
           git commit -m "Update README card"
           # Cache-bust: update the README image URL with a fresh timestamp
