@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Thesilentprogramer/Thesilentprogramer/main/assets/readme.svg?t=1792222255" alt="Shubham Indulkar: tech stack, GitHub contributions, top languages, merged open source PRs, and estimated AI token spend" />
+  <img src="https://raw.githubusercontent.com/Thesilentprogramer/Thesilentprogramer/main/assets/readme.svg?t=1792232826" alt="Shubham Indulkar: tech stack, GitHub contributions, top languages, merged open source PRs, and estimated AI token spend" />
 </p>
 
 <p align="center">
