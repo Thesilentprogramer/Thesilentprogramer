@@ -31,8 +31,8 @@ ENDPOINT = f"repos/{REPO}/contents/{REMOTE_PATH}"
 LABEL = "com.thesilentprogramer.token-spend"
 GH_FALLBACKS = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]
 SYSTEM_PYTHON = "/usr/bin/python3"
-LEDGER_VERSION = 1
-CODEX_FIELDS = ("total_tokens", "cached_input_tokens")
+LEDGER_VERSION = 2
+CODEX_FIELDS = ("total_tokens", "cached_input_tokens", "input_tokens", "output_tokens", "reasoning_output_tokens")
 CURSOR_USAGE_START_MS = "1761350400000"  # 2025-10-25, matches the first ledger day
 CURSOR_USAGE_PAGE = 200
 # ponytail: dashboard API stops at 50 pages (~10k events). Raise if lifetime history truncates.
@@ -95,7 +95,7 @@ def codex_day(rel_path):
 
 
 def scan_codex_file(path):
-    """(all, fresh) this file adds beyond the cumulative total it started from, or None."""
+    """Return token breakdown for the work added by this session file."""
     first = last = None
     for o in read_json_lines(path, "total_token_usage"):
         info = (o.get("payload") or {}).get("info") or {}
@@ -109,7 +109,11 @@ def scan_codex_file(path):
     if last is None:
         return None
     delta = {k: (last.get(k) or 0) - first[k] for k in CODEX_FIELDS}
-    return delta["total_tokens"], delta["total_tokens"] - delta["cached_input_tokens"]
+    return {
+        **delta,
+        "all": delta["total_tokens"],
+        "fresh": delta["total_tokens"] - delta["cached_input_tokens"],
+    }
 
 
 def scan_codex(home):
@@ -127,7 +131,7 @@ def scan_codex(home):
             if counts is None:
                 continue
             rel = os.path.relpath(path, root)
-            files[os.path.basename(rel)] = {"all": counts[0], "fresh": counts[1], "day": codex_day(rel)}
+            files[os.path.basename(rel)] = {**counts, "day": codex_day(rel)}
     return files
 
 
@@ -425,6 +429,7 @@ def bump_tokens_from_dashboard(path, token, now=None):
         "fresh": int(existing["fresh"]) + add_fresh,
         "since": existing.get("since"),
         "updated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        **({"breakdown": existing["breakdown"]} if existing.get("breakdown") else {}),
     }, True
 
 
@@ -659,6 +664,11 @@ def summarize(ledger):
         "all": sum(s["all"] for s in sources.values()),
         "fresh": sum(s["fresh"] for s in sources.values()),
     }
+    codex_breakdown = {field: 0 for field in CODEX_FIELDS}
+    for counts in ledger.get("codex", {}).values():
+        for field in CODEX_FIELDS:
+            codex_breakdown[field] += int(counts.get(field, 0) or 0)
+    totals["breakdown"] = {"codex": codex_breakdown}
     return sources, totals, min(days) if days else None
 
 
@@ -685,12 +695,15 @@ def compute(home, ledger_path, published=None):
 
 def build_output(totals, since, now=None):
     now = now or datetime.now(timezone.utc)
-    return {
+    output = {
         "total": int(totals["all"]),
         "fresh": int(totals["fresh"]),
         "since": since,
         "updated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if totals.get("breakdown"):
+        output["breakdown"] = totals["breakdown"]
+    return output
 
 
 def render(output):
@@ -746,6 +759,14 @@ def upload(gh, published, output):
         print(f"{REMOTE_PATH} is not on {BRANCH} yet; skipping upload")
         return
     sha, current = published
+    remote_updated = current.get("updated")
+    if remote_updated:
+        try:
+            age_hours = (datetime.now(timezone.utc) - datetime.strptime(remote_updated, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds() / 3600
+            if age_hours > 30:
+                print(f"warning: remote token data is {age_hours:.1f}h old; attempting refresh")
+        except ValueError:
+            print("warning: remote token data has an invalid updated timestamp")
     # Never make the card go down
     if output["total"] <= current.get("total", 0):
         print(f"remote total {current.get('total')} is not below {output['total']}; skipping upload")

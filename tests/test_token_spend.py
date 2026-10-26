@@ -83,9 +83,13 @@ class TokenSpendTests(unittest.TestCase):
         codex = MODULE.scan_codex(str(self.home))
 
         first = codex["rollout-2026-01-05T01-00-00-a.jsonl"]
-        self.assertEqual(first, {"all": 600, "fresh": 360, "day": "2026-01-05"})
+        self.assertEqual(first["all"], 600)
+        self.assertEqual(first["fresh"], 360)
+        self.assertEqual(first["day"], "2026-01-05")
         archived = codex["rollout-2025-12-26T01-00-00-b.jsonl"]
-        self.assertEqual(archived, {"all": 50, "fresh": 40, "day": "2025-12-26"})
+        self.assertEqual(archived["all"], 50)
+        self.assertEqual(archived["fresh"], 40)
+        self.assertEqual(archived["day"], "2025-12-26")
 
     def test_archiving_a_codex_session_keeps_one_ledger_entry(self):
         live = self.home / ".codex" / "sessions" / "2026" / "02" / "01" / "rollout-2026-02-01T00-00-00-c.jsonl"
@@ -189,7 +193,8 @@ class TokenSpendTests(unittest.TestCase):
         self.assertNotIn("stats_cache", sources)
         self.assertEqual(sources["claude"], {"all": 20, "fresh": 15})
         self.assertEqual(sources["codex"], {"all": 7, "fresh": 5})
-        self.assertEqual(totals, {"all": 5027, "fresh": 920})
+        self.assertEqual(totals["all"], 5027)
+        self.assertEqual(totals["fresh"], 920)
         self.assertEqual(since, "2025-12-26")
         # The seed is frozen; a later, larger published total does not replace it
         again = self.compute({**published, "total": 10 ** 9})
@@ -201,7 +206,8 @@ class TokenSpendTests(unittest.TestCase):
 
         _, totals, _ = self.compute(published)
 
-        self.assertEqual(totals, {"all": 1100 + 4 + 20 + 30 + 7, "fresh": 100 + 3 + 15 + 20 + 5})
+        self.assertEqual(totals["all"], 1100 + 4 + 20 + 30 + 7)
+        self.assertEqual(totals["fresh"], 100 + 3 + 15 + 20 + 5)
         self.assertNotIn("published", json.loads(self.ledger.read_text()))
 
     def test_output_json_shape(self):
@@ -217,7 +223,8 @@ class TokenSpendTests(unittest.TestCase):
         self.assertTrue(text.endswith("}\n"))
         self.assertEqual(text, json.dumps(json.loads(text), indent=2) + "\n")
         data = json.loads(text)
-        self.assertEqual(list(data), ["total", "fresh", "since", "updated"])
+        self.assertEqual(list(data), ["total", "fresh", "since", "updated", "breakdown"])
+        self.assertEqual(data["breakdown"]["codex"]["total_tokens"], 30)
         self.assertEqual(data["total"], 40)
         self.assertEqual(data["fresh"], 26)
         self.assertEqual(data["since"], "2025-12-26")
@@ -231,6 +238,37 @@ class TokenSpendTests(unittest.TestCase):
         expected = self.home / "Library" / "Application Support" / "token-spend" / "ledger.json"
         self.assertTrue(expected.exists())
         self.assertIn("total 0/0 since None", out.getvalue())
+
+    def test_codex_breakdown_preserves_input_output_and_reasoning(self):
+        write_jsonl(
+            self.home / ".codex" / "sessions" / "2026" / "10" / "26" / "rollout-breakdown.jsonl",
+            [
+                {"payload": {"info": {
+                    "total_token_usage": {"total_tokens": 100, "cached_input_tokens": 20,
+                                            "input_tokens": 70, "output_tokens": 30,
+                                            "reasoning_output_tokens": 10},
+                    "last_token_usage": {"total_tokens": 0, "cached_input_tokens": 0,
+                                          "input_tokens": 0, "output_tokens": 0,
+                                          "reasoning_output_tokens": 0},
+                }}},
+                {"payload": {"info": {
+                    "total_token_usage": {"total_tokens": 280, "cached_input_tokens": 60,
+                                            "input_tokens": 190, "output_tokens": 90,
+                                            "reasoning_output_tokens": 30},
+                    "last_token_usage": {"total_tokens": 100, "cached_input_tokens": 20,
+                                          "input_tokens": 70, "output_tokens": 30,
+                                          "reasoning_output_tokens": 10},
+                }}},
+            ],
+        )
+        totals = self.compute(None)[1]
+        self.assertEqual(totals["breakdown"]["codex"], {
+            "total_tokens": 180,
+            "cached_input_tokens": 40,
+            "input_tokens": 120,
+            "output_tokens": 60,
+            "reasoning_output_tokens": 20,
+        })
 
 
 def _varint(n):
